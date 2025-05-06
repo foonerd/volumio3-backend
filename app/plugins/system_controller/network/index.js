@@ -650,7 +650,7 @@ ControllerNetwork.prototype.rebuildHotspotConfig = function (forceHotspotConfigu
         hs.end();
         self.commandRouter.wirelessRestart();
       } catch (err) {
-
+        // Ignore
       }
     }
   });
@@ -665,14 +665,49 @@ ControllerNetwork.prototype.wirelessConnect = function (data) {
     netstring += self.getNetworkWpaSupplicantEntry(data.ssid, data.pass, 2);
   }
 
-  self.writeWpaSupplicantConf(netstring, data);
+  this.getAdditionalWpaSupplicantConf(netstring, data).then((wpaSupplicantConf) => {
+    exec('/usr/bin/sudo /bin/chmod 777 /etc/wpa_supplicant/wpa_supplicant.conf', { uid: 1000, gid: 1000 }, function (error, stdout, stderr) {
+      if (error !== null) {
+        self.logger.error('Cannot set permissions for wpa_supplicant.conf: ' + error);
+      } else {
+        fs.writeFile('/etc/wpa_supplicant/wpa_supplicant.conf', wpaSupplicantConf, function (err) {
+          if (err) {
+            self.logger.error('Cannot write wpa_supplicant.conf: ' + err);
+          }
+          fs.writeFile('/data/configuration/netconfigured', ' ', function (err) {
+            if (err) {
+              self.logger.error('Cannot write netconfigured: ' + err);
+            }
+          });
+
+          // Delay and safe check before restarting
+          setTimeout(() => {
+            try {
+              const wlanState = execSync('ip link show wlan0').toString();
+              if (wlanState.includes('state DOWN') || wlanState.includes('NO-CARRIER')) {
+                self.commandRouter.wirelessRestart();
+              } else {
+                self.logger.info('wlan0 still active after hotspot teardown — proceeding with caution');
+                self.commandRouter.wirelessRestart();
+              }
+            } catch (checkErr) {
+              self.logger.error('wlan0 status check failed: ' + checkErr);
+              self.commandRouter.wirelessRestart(); // fallback
+            }
+          }, 4000); // Adjust delay as needed
+        });
+      }
+    });
+  }).fail(function (err) {
+    self.logger.error('Cannot get additional WPA Supplicant Networks: ' + err);
+  });
 };
 
 ControllerNetwork.prototype.writeWpaSupplicantConf = function (netstring, data) {
   var self = this;
 
-  this.getAdditionalWpaSupplicantConf(netstring, data).then((wpaSupplicantConf)=> {
-    exec('/usr/bin/sudo /bin/chmod 777 /etc/wpa_supplicant/wpa_supplicant.conf', {uid: 1000, gid: 1000}, function (error, stdout, stderr) {
+  this.getAdditionalWpaSupplicantConf(netstring, data).then((wpaSupplicantConf) => {
+    exec('/usr/bin/sudo /bin/chmod 777 /etc/wpa_supplicant/wpa_supplicant.conf', { uid: 1000, gid: 1000 }, function (error, stdout, stderr) {
       if (error !== null) {
         self.logger.error('Cannot set permissions for /etc/network/interfaces: ' + error);
       } else {
@@ -680,20 +715,25 @@ ControllerNetwork.prototype.writeWpaSupplicantConf = function (netstring, data) 
           if (err) {
             self.logger.error('Cannot write wpasupplicant.conf ' + err);
           }
+
           fs.writeFile('/data/configuration/netconfigured', ' ', function (err) {
             if (err) {
-              self.logger.error('Cannot write netconfigured ' + error);
+              self.logger.error('Cannot write netconfigured ' + err);
             }
           });
-          self.commandRouter.wirelessRestart();
+
+          // Add a delay before restarting wireless stack to allow hostapd to shut down
+          self.logger.info('Waiting 3s before wirelessRestart to allow interface cleanup...');
+          setTimeout(() => {
+            self.commandRouter.wirelessRestart();
+          }, 3000);
         });
       }
     });
   }).fail(function (err) {
     self.logger.error('Cannot get additional WPA Supplicant Networks: ' + err);
   });
-
-}
+};
 
 ControllerNetwork.prototype.getAdditionalWpaSupplicantConf = function (netstring, data) {
   var defer = libQ.defer();
@@ -703,14 +743,15 @@ ControllerNetwork.prototype.getAdditionalWpaSupplicantConf = function (netstring
   var alreadyConfiguredWifi = data && data.ssid || 'n';
 
   if (savedWirelessNetworks && savedWirelessNetworks.length) {
-    for (var i in savedWirelessNetworks) {
-      var index = i;
-      var configuredSSID = config.get('wirelessNetworksSSID[' + index + ']');
-      if (alreadyConfiguredWifi != configuredSSID && configuredSSID !== undefined && configuredSSID.length > 0) {
-        var configuredPASS = config.get('wirelessNetworksPASSWD[' + index + ']');
+    var entriesProcessed = 0;
+    for (var i = 0; i < savedWirelessNetworks.length; i++) {
+      var configuredSSID = config.get('wirelessNetworksSSID[' + i + ']');
+      if (alreadyConfiguredWifi !== configuredSSID && configuredSSID !== undefined && configuredSSID.length > 0) {
+        var configuredPASS = config.get('wirelessNetworksPASSWD[' + i + ']');
         augmentedNetstring += self.getNetworkWpaSupplicantEntry(configuredSSID, configuredPASS, 0);
       }
-      if (index == savedWirelessNetworks.length-1) {
+      entriesProcessed++;
+      if (entriesProcessed === savedWirelessNetworks.length) {
         defer.resolve(augmentedNetstring);
       }
     }
@@ -796,6 +837,7 @@ ControllerNetwork.prototype.rebuildNetworkConfig = function (networkInterfaceToR
         ws.write('iface wlan0 inet manual\n');
 
         if (config.get('wirelessdhcp') == true || config.get('wirelessdhcp') == 'true') {
+          // leave it dhcp
         } else if (config.get('wirelessdhcp') == false || config.get('wirelessdhcp') == 'false') {
           staticconf.write('interface wlan0\n');
           staticconf.write('static ip_address=' + config.get('wirelessip') + '/24\n');
@@ -1230,16 +1272,20 @@ ControllerNetwork.prototype.refreshCachedPAddresses = function () {
 ControllerNetwork.prototype.restoreNetworkBackup = function () {
   var self = this;
 
+  var VConf = require('v-conf'); // Proper constructor import
+
   var networkBackupPath = '/imgpart/networkconfig.json';
 
   fs.access(networkBackupPath, fs.F_OK, (err) => {
-    if (err) {} else {
+    if (err) {
+      // No backup found, skip
+    } else {
       self.logger.info('Network Backup Found, restore started');
-      exec('/usr/bin/sudo /bin/chmod 777 ' + networkBackupPath, {uid: 1000, gid: 1000}, function (error, stdout, stderr) {
-        if (err) {
-          self.logger.error('Could not set ownership of network backup: ' + err);
+      exec('/usr/bin/sudo /bin/chmod 777 ' + networkBackupPath, { uid: 1000, gid: 1000 }, function (error, stdout, stderr) {
+        if (error) {
+          self.logger.error('Could not set ownership of network backup: ' + error);
         } else {
-          var backupConfig = new (require('v-conf'))();
+          var backupConfig = new VConf();
           backupConfig.loadFile(networkBackupPath);
           self.applyNetworkBackup(backupConfig.data);
           fs.unlink(networkBackupPath, function (err) {
@@ -1250,7 +1296,7 @@ ControllerNetwork.prototype.restoreNetworkBackup = function () {
         }
       });
     }
-  })
+  });
 };
 
 ControllerNetwork.prototype.applyNetworkBackup = function (data) {
